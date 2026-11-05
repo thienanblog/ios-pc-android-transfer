@@ -23,11 +23,14 @@ import (
 
 // Config is what the server needs from main.
 type Config struct {
-	DataDir string      // shared folder: received files land here, files put here can be downloaded
-	Token   string      // access key carried in the QR code link
-	Tools   media.Tools // converters found on this computer
-	Version string
-	Web     fs.FS // static web page files
+	DataDir string // shared folder: received files land here, files put here can be downloaded
+	// StateDir keeps the access key, unfinished uploads and converted copies.
+	// Defaults to DataDir/.photobridge.
+	StateDir string
+	Token    string      // access key carried in the QR code link
+	Tools    media.Tools // converters found on this computer
+	Version  string
+	Web      fs.FS // static web page files
 	// URLs returns the links (with token) phones should open, best first.
 	URLs func() []string
 	// Logf is used for request errors; defaults to log.Printf.
@@ -70,7 +73,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{
 		cfg:        cfg,
-		stateDir:   filepath.Join(cfg.DataDir, stateFolder),
+		stateDir:   cfg.StateDir,
 		uploadMus:  map[string]*sync.Mutex{},
 		probes:     map[string]probeEntry{},
 		jobs:       map[string]*job{},
@@ -78,6 +81,9 @@ func New(cfg Config) (*Server, error) {
 		thumbMus:   map[string]*sync.Mutex{},
 		convertSem: make(chan struct{}, 2),
 		thumbSem:   make(chan struct{}, 3),
+	}
+	if s.stateDir == "" {
+		s.stateDir = filepath.Join(cfg.DataDir, stateFolder)
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	for _, d := range []string{s.partsDir(), s.cacheDir(), s.thumbsDir()} {
@@ -117,9 +123,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/uploads/{id}", s.handleUploadStatus)
 	mux.HandleFunc("PUT /api/uploads/{id}", s.handleUploadChunk)
 	mux.HandleFunc("GET /api/files", s.handleList)
-	mux.HandleFunc("GET /api/files/{name}", s.handleDownload)
-	mux.HandleFunc("DELETE /api/files/{name}", s.handleDelete)
-	mux.HandleFunc("GET /api/thumbs/{name}", s.handleThumb)
+	mux.HandleFunc("GET /api/files/{path...}", s.handleDownload)
+	mux.HandleFunc("DELETE /api/files/{path...}", s.handleDelete)
+	mux.HandleFunc("POST /api/folders", s.handleMkdir)
+	mux.HandleFunc("GET /api/thumbs/{path...}", s.handleThumb)
 	mux.HandleFunc("POST /api/convert", s.handleConvert)
 	mux.HandleFunc("GET /api/converted/{key}", s.handleConverted)
 	return s.guard(mux)

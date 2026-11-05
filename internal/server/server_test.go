@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -257,8 +258,10 @@ func TestListDownloadDelete(t *testing.T) {
 		t.Fatalf("unicode download: %d %q", w.Code, w.Header().Get("Content-Disposition"))
 	}
 
-	for _, bad := range []string{".hidden", "..%2Fsecret", "nope.jpg", "%2E%2E"} {
-		if w := do(t, h, "GET", "/api/files/"+bad, nil); w.Code != http.StatusNotFound {
+	for _, bad := range []string{".hidden", "..%2Fsecret", "nope.jpg", "%2E%2E", "a/../../etc/passwd", "sub%5C..%5Cx"} {
+		// The router may answer a ".." path with a redirect to the cleaned
+		// path instead; either way nothing is served.
+		if w := do(t, h, "GET", "/api/files/"+bad, nil); w.Code != http.StatusNotFound && w.Code != http.StatusMovedPermanently {
 			t.Errorf("%s: %d", bad, w.Code)
 		}
 	}
@@ -275,11 +278,11 @@ func TestConvertWithoutTools(t *testing.T) {
 	_, h, dir := newTestServer(t, media.Tools{})
 	src, _ := os.ReadFile(filepath.Join("..", "media", "testdata", "small.heic"))
 	os.WriteFile(filepath.Join(dir, "a.heic"), src, 0o644)
-	m := decode(t, do(t, h, "POST", "/api/convert", []byte(`{"name":"a.heic","to":"jpg"}`)))
+	m := decode(t, do(t, h, "POST", "/api/convert", []byte(`{"path":"a.heic","to":"jpg"}`)))
 	if m["state"] != "error" || m["error"] != "image-tool-missing" {
 		t.Fatalf("got %v", m)
 	}
-	w := do(t, h, "POST", "/api/convert", []byte(`{"name":"a.heic","to":"mp4"}`))
+	w := do(t, h, "POST", "/api/convert", []byte(`{"path":"a.heic","to":"mp4"}`))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("image to mp4: %d", w.Code)
 	}
@@ -296,7 +299,7 @@ func TestConvertJobs(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, f), src, 0o644)
 	}
 	for _, c := range []struct{ name, to, format string }{{"small.heic", "jpg", "jpeg"}, {"small.heic", "png", "png"}, {"hevc.mov", "mp4", "mp4"}} {
-		body := []byte(`{"name":"` + c.name + `","to":"` + c.to + `"}`)
+		body := []byte(`{"path":"` + c.name + `","to":"` + c.to + `"}`)
 		var m map[string]any
 		deadline := time.Now().Add(time.Minute)
 		for {
@@ -357,5 +360,96 @@ func TestSafeName(t *testing.T) {
 	long := strings.Repeat("ả", 150) + ".jpg"
 	if got := SafeName(long); len(got) > 200 || !strings.HasSuffix(got, ".jpg") {
 		t.Errorf("long name: %d bytes", len(got))
+	}
+}
+
+func TestFolders(t *testing.T) {
+	_, h, dir := newTestServer(t, media.Tools{})
+
+	// Create a folder, then upload into it.
+	m := decode(t, do(t, h, "POST", "/api/folders", []byte(`{"dir":"","name":"Đà Lạt 2026"}`)))
+	if m["path"] != "Đà Lạt 2026" {
+		t.Fatalf("mkdir: %v", m)
+	}
+	if w := do(t, h, "POST", "/api/folders", []byte(`{"dir":"","name":"Đà Lạt 2026"}`)); w.Code != http.StatusConflict {
+		t.Fatalf("duplicate mkdir: %d", w.Code)
+	}
+	if w := do(t, h, "POST", "/api/folders", []byte(`{"dir":"../x","name":"a"}`)); w.Code != http.StatusBadRequest {
+		t.Fatalf("mkdir outside: %d", w.Code)
+	}
+	m = decode(t, do(t, h, "POST", "/api/folders", []byte(`{"dir":"Đà Lạt 2026","name":"../../evil"}`)))
+	if m["path"] != "Đà Lạt 2026/evil" {
+		t.Fatalf("nested mkdir name not cleaned: %v", m)
+	}
+
+	init, _ := json.Marshal(map[string]any{"dir": "Đà Lạt 2026", "name": "a.jpg", "size": 4, "lastModified": 1})
+	id := decode(t, do(t, h, "POST", "/api/uploads", init))["id"].(string)
+	m = decode(t, do(t, h, "PUT", "/api/uploads/"+id+"?offset=0", []byte("\xFF\xD8\xFF\x00")))
+	if f := m["file"].(map[string]any); f["path"] != "Đà Lạt 2026/a.jpg" || f["format"] != "jpeg" {
+		t.Fatalf("upload into folder: %v", m)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Đà Lạt 2026", "a.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	bad, _ := json.Marshal(map[string]any{"dir": "../outside", "name": "a.jpg", "size": 4})
+	if w := do(t, h, "POST", "/api/uploads", bad); w.Code != http.StatusBadRequest {
+		t.Fatalf("upload outside: %d", w.Code)
+	}
+	missing, _ := json.Marshal(map[string]any{"dir": "nope", "name": "a.jpg", "size": 4})
+	if w := do(t, h, "POST", "/api/uploads", missing); w.Code != http.StatusNotFound {
+		t.Fatalf("upload to missing folder: %d", w.Code)
+	}
+
+	// Listing the top shows the folder; listing inside shows the file.
+	m = decode(t, do(t, h, "GET", "/api/files", nil))
+	folders := m["folders"].([]any)
+	if len(folders) != 1 || folders[0].(map[string]any)["items"].(float64) != 2 {
+		t.Fatalf("top listing: %v", m)
+	}
+	m = decode(t, do(t, h, "GET", "/api/files?dir="+url.QueryEscape("Đà Lạt 2026"), nil))
+	if len(m["files"].([]any)) != 1 || len(m["folders"].([]any)) != 1 {
+		t.Fatalf("folder listing: %v", m)
+	}
+	if w := do(t, h, "GET", "/api/files?dir=..", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("list outside: %d", w.Code)
+	}
+
+	// Download by path.
+	w := do(t, h, "GET", "/api/files/"+url.PathEscape("Đà Lạt 2026")+"/a.jpg", nil)
+	if w.Code != 200 || w.Body.Len() != 4 {
+		t.Fatalf("download in folder: %d", w.Code)
+	}
+
+	// A folder with files cannot be deleted; an empty one can.
+	if w := do(t, h, "DELETE", "/api/files/"+url.PathEscape("Đà Lạt 2026"), nil); w.Code != http.StatusConflict {
+		t.Fatalf("delete non-empty: %d", w.Code)
+	}
+	if w := do(t, h, "DELETE", "/api/files/"+url.PathEscape("Đà Lạt 2026")+"/evil", nil); w.Code != 200 {
+		t.Fatalf("delete empty: %d", w.Code)
+	}
+	if w := do(t, h, "DELETE", "/api/files/"+url.PathEscape("Đà Lạt 2026")+"/a.jpg", nil); w.Code != 200 {
+		t.Fatalf("delete file: %d", w.Code)
+	}
+	os.WriteFile(filepath.Join(dir, "Đà Lạt 2026", ".DS_Store"), []byte("x"), 0o644)
+	if w := do(t, h, "DELETE", "/api/files/"+url.PathEscape("Đà Lạt 2026"), nil); w.Code != 200 {
+		t.Fatalf("delete folder with only system files: %d %s", w.Code, w.Body)
+	}
+	if w := do(t, h, "DELETE", "/api/files/", nil); w.Code == 200 {
+		t.Fatal("deleting the shared folder itself must fail")
+	}
+}
+
+func TestSymlinkEscapeRefused(t *testing.T) {
+	_, h, dir := newTestServer(t, media.Tools{})
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "secret.jpg"), []byte("\xFF\xD8\xFFsecret"), 0o644)
+	if err := os.Symlink(outside, filepath.Join(dir, "link")); err != nil {
+		t.Skip("symlinks not available")
+	}
+	if w := do(t, h, "GET", "/api/files/link/secret.jpg", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("followed symlink: %d", w.Code)
+	}
+	if w := do(t, h, "GET", "/api/files?dir=link", nil); w.Code == http.StatusOK {
+		t.Fatalf("listed through symlink")
 	}
 }

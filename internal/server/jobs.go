@@ -35,7 +35,7 @@ var targetExt = map[string]string{"jpg": ".jpg", "png": ".png", "mp4": ".mp4"}
 
 func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
+		Path string `json:"path"`
 		To   string `json:"to"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
@@ -47,7 +47,7 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to must be jpg, png or mp4"})
 		return
 	}
-	path, fi, ok := s.lookup(req.Name)
+	src, fi, ok := s.lookup(req.Path)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
@@ -88,7 +88,7 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		j = &job{state: "queued"}
 		s.jobs[key] = j
-		go s.runJob(j, path, out, req.To)
+		go s.runJob(j, src, out, req.To)
 	}
 	s.mu.Unlock()
 

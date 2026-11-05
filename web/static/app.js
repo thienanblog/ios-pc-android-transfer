@@ -10,10 +10,13 @@ const $ = (s, el = document) => el.querySelector(s);
 const state = {
   info: null,
   caps: { heic: false, hevc: false },
+  dir: '',
+  folders: [],
   files: [],
   listSig: '',
-  selected: new Set(),
-  busy: new Map(), // file name -> status text while converting/downloading
+  selected: new Set(), // file paths
+  busy: new Map(), // file path -> {text, error}
+  viewIndex: -1,
 };
 
 const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
@@ -35,6 +38,16 @@ async function api(path, opts = {}) {
   if (res.status === 401) setConn('bad', 'Mất kết nối, hãy quét lại mã QR');
   return { res, body: body || {} };
 }
+
+const postJSON = (path, data) => api(path, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(data),
+});
+
+const encPath = (p) => p.split('/').map(encodeURIComponent).join('/');
+const fileURL = (f, inline) => '/api/files/' + encPath(f.path) + (inline ? '?inline=1' : '');
+const withInline = (url) => url + (url.includes('?') ? '&' : '?') + 'inline=1';
 
 function setConn(kind, text) {
   const c = $('#conn');
@@ -79,10 +92,8 @@ async function detectHEVC() {
   return ok;
 }
 
-function renderCaps() {
-  const yes = (b) => (b ? 'có' : 'không');
-  $('#caps').textContent = `Trình duyệt này mở được ảnh HEIC: ${yes(state.caps.heic)} · video HEVC: ${yes(state.caps.hevc)}`;
-}
+const canShowImage = (f) => NATIVE_IMAGES.has(f.format) || (f.format === 'heic' && state.caps.heic);
+const canPlayVideo = (f) => f.videoCodec === 'h264' || (f.videoCodec === 'hevc' && state.caps.hevc);
 
 // ---------- Start ----------
 
@@ -98,7 +109,8 @@ async function init() {
 
   const [heic, hevc] = await Promise.all([detectHEIC(), detectHEVC()]);
   state.caps = { heic, hevc };
-  renderCaps();
+  const yes = (b) => (b ? 'có' : 'không');
+  $('#caps').textContent = `Trình duyệt này mở được ảnh HEIC: ${yes(heic)} · video HEVC: ${yes(hevc)}`;
 
   const { res, body } = await api('/api/info');
   if (!res.ok) return;
@@ -109,9 +121,20 @@ async function init() {
 
   setupUpload();
   setupList();
-  await refresh();
+  setupViewer();
+  state.dir = dirFromHash();
+  window.addEventListener('hashchange', () => {
+    const d = dirFromHash();
+    if (d !== state.dir) openDir(d, false);
+  });
+  await openDir(state.dir, false);
   setInterval(() => { if (!document.hidden) refresh(); }, 4000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+}
+
+function dirFromHash() {
+  const h = location.hash.replace(/^#\/?/, '');
+  try { return decodeURIComponent(h); } catch (_) { return ''; }
 }
 
 function setupPC(info) {
@@ -139,7 +162,7 @@ function setupPC(info) {
   const t = info.tools || {};
   const warn = [];
   if (!t.images) {
-    warn.push('Chưa có công cụ đổi ảnh HEIC sang JPG/PNG. Cài <b>ffmpeg 7.1 trở lên</b> hoặc <b>ImageMagick</b> (xem README), rồi mở lại PhotoBridge.');
+    warn.push('Chưa có công cụ đổi ảnh HEIC. Trình duyệt Chrome, Edge, Android sẽ không xem trước được ảnh HEIC. Cài <b>ffmpeg 7.1 trở lên</b> hoặc <b>ImageMagick</b> (xem README) rồi mở lại PhotoBridge.');
   }
   if (!t.videos) {
     warn.push('Chưa có <b>ffmpeg</b> nên chưa đổi được video HEVC sang MP4 H.264. File gốc vẫn gửi và nhận bình thường.');
@@ -148,6 +171,47 @@ function setupPC(info) {
     $('#tool-warn').innerHTML = warn.join('<br>');
     $('#tool-warn').hidden = false;
   }
+}
+
+// ---------- Folders ----------
+
+async function openDir(dir, push = true) {
+  state.dir = dir;
+  state.selected.clear();
+  state.listSig = '';
+  const h = dir ? '#/' + encodeURIComponent(dir) : '#/';
+  if (push && location.hash !== h) location.hash = h;
+  renderCrumbs();
+  $('#upload-target').textContent = ['shared', ...(dir ? dir.split('/') : [])].join(' / ');
+  $('#files').replaceChildren();
+  await refresh();
+}
+
+function renderCrumbs() {
+  const nav = $('#crumbs');
+  nav.replaceChildren();
+  const parts = state.dir ? state.dir.split('/') : [];
+  const crumbs = [{ name: 'shared', path: '' }];
+  parts.forEach((p, i) => crumbs.push({ name: p, path: parts.slice(0, i + 1).join('/') }));
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'sep';
+      sep.textContent = '›';
+      nav.append(sep);
+    }
+    if (i === crumbs.length - 1) {
+      const here = document.createElement('span');
+      here.className = 'here';
+      here.textContent = c.name;
+      nav.append(here);
+    } else {
+      const b = document.createElement('button');
+      b.textContent = c.name;
+      b.addEventListener('click', () => openDir(c.path));
+      nav.append(b);
+    }
+  });
 }
 
 // ---------- Sending files to the computer ----------
@@ -183,7 +247,8 @@ function enqueue(files) {
     li.innerHTML = '<div class="top-line"><span class="qname"></span><span class="qstate muted">Đang chờ</span></div><progress max="1" value="0"></progress>';
     $('.qname', li).textContent = file.name;
     $('#queue').prepend(li);
-    uploadQueue.push({ file, li });
+    // Remember the folder at the moment the file was chosen.
+    uploadQueue.push({ file, li, dir: state.dir });
   }
   pump();
 }
@@ -197,7 +262,7 @@ async function pump() {
     const bar = $('progress', item.li);
     try {
       st.textContent = 'Đang gửi…';
-      const saved = await uploadFile(item.file, (f) => {
+      const saved = await uploadFile(item.file, item.dir, (f) => {
         bar.value = f;
         st.textContent = Math.floor(f * 100) + '%';
       });
@@ -214,13 +279,11 @@ async function pump() {
   uploading = false;
 }
 
-async function uploadFile(file, onProgress) {
-  const { res, body } = await api('/api/uploads', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: file.name, size: file.size, lastModified: file.lastModified || 0 }),
+async function uploadFile(file, dir, onProgress) {
+  const { res, body } = await postJSON('/api/uploads', {
+    dir, name: file.name, size: file.size, lastModified: file.lastModified || 0,
   });
-  if (!res.ok) throw new Error(body.error || res.status);
+  if (!res.ok) throw new Error(body.error === 'folder not found' ? 'thư mục đã bị xoá' : (body.error || res.status));
   if (body.done) return body.file;
   const id = body.id;
   let offset = body.offset;
@@ -282,7 +345,8 @@ function formatBadges(f, afterUpload) {
   return out;
 }
 
-// conversionFor decides what the file should become on this device, or null for the original.
+// conversionFor decides what the file should become when downloaded on this
+// device, or null for the original.
 function conversionFor(f) {
   const mode = $('#mode').value;
   if (mode === 'original') return null;
@@ -300,84 +364,130 @@ function conversionFor(f) {
 }
 
 function setupList() {
+  $('#new-folder').addEventListener('click', async () => {
+    const name = prompt('Tên thư mục mới');
+    if (!name || !name.trim()) return;
+    const { res, body } = await postJSON('/api/folders', { dir: state.dir, name: name.trim() });
+    if (res.status === 409) alert('Đã có thư mục tên này.');
+    else if (!res.ok) alert('Không tạo được thư mục: ' + (body.error || res.status));
+    else openDir(body.path);
+  });
   $('#select-all').addEventListener('click', () => {
     const all = state.selected.size < state.files.length;
-    state.selected = new Set(all ? state.files.map((f) => f.name) : []);
+    state.selected = new Set(all ? state.files.map((f) => f.path) : []);
     render();
   });
   $('#download-selected').addEventListener('click', async () => {
-    const names = state.files.filter((f) => state.selected.has(f.name));
-    for (const f of names) {
+    const chosen = state.files.filter((f) => state.selected.has(f.path));
+    for (const f of chosen) {
       await download(f);
       await sleep(700); // browsers block bursts of downloads
     }
   });
   $('#delete-selected').addEventListener('click', async () => {
-    const names = [...state.selected];
-    if (!names.length || !confirm(`Xoá ${names.length} file khỏi máy tính?`)) return;
-    for (const n of names) await api('/api/files/' + encodeURIComponent(n), { method: 'DELETE' });
+    const paths = [...state.selected];
+    if (!paths.length || !confirm(`Xoá ${paths.length} file khỏi thư mục chia sẻ? Thao tác này không hoàn tác được.`)) return;
+    for (const p of paths) await api('/api/files/' + encPath(p), { method: 'DELETE' });
     state.selected.clear();
     refresh();
   });
 }
 
 async function refresh() {
-  const { res, body } = await api('/api/files').catch(() => ({ res: { ok: false }, body: {} }));
+  const dir = state.dir;
+  const { res, body } = await api('/api/files?dir=' + encodeURIComponent(dir))
+    .catch(() => ({ res: { ok: false, status: 0 }, body: {} }));
+  if (dir !== state.dir) return; // the user moved on meanwhile
+  if (res.status === 404 && dir) {
+    openDir('', true); // the folder was deleted elsewhere
+    return;
+  }
   if (!res.ok) {
     if (res.status !== 401) setConn('bad', 'Mất kết nối với máy tính');
     return;
   }
   setConn('ok', 'Đã kết nối');
-  const files = body.files || [];
-  const sig = JSON.stringify(files);
+  const sig = JSON.stringify([body.folders, body.files]);
   if (sig === state.listSig) return;
   state.listSig = sig;
-  state.files = files;
-  const names = new Set(files.map((f) => f.name));
-  state.selected.forEach((n) => { if (!names.has(n)) state.selected.delete(n); });
+  state.folders = body.folders || [];
+  state.files = body.files || [];
+  const paths = new Set(state.files.map((f) => f.path));
+  state.selected.forEach((p) => { if (!paths.has(p)) state.selected.delete(p); });
   render();
 }
 
 function render() {
   const list = $('#files');
-  const tpl = $('#file-tpl');
   const existing = new Map([...list.children].map((li) => [li.dataset.key, li]));
   const keep = new Set();
   let prev = null;
-
-  for (const f of state.files) {
-    const key = `${f.name}|${f.size}|${f.modified}`;
-    keep.add(key);
-    let li = existing.get(key);
-    if (!li) {
-      li = tpl.content.firstElementChild.cloneNode(true);
-      li.dataset.key = key;
-      fillCard(li, f);
-    }
-    const sel = $('.sel', li);
-    sel.checked = state.selected.has(f.name);
-    li.classList.toggle('selected', sel.checked);
-    const busy = state.busy.get(f.name);
-    const status = $('.status', li);
-    status.hidden = !busy;
-    if (busy) { status.textContent = busy.text; status.classList.toggle('err', !!busy.error); }
-    // Keep DOM order equal to list order without re-creating cards.
+  const place = (li) => {
     const want = prev ? prev.nextSibling : list.firstChild;
     if (want !== li) list.insertBefore(li, want);
     prev = li;
+  };
+
+  for (const d of state.folders) {
+    const key = `d|${d.path}|${d.items}`;
+    keep.add(key);
+    let li = existing.get(key);
+    if (!li) {
+      li = $('#folder-tpl').content.firstElementChild.cloneNode(true);
+      li.dataset.key = key;
+      fillFolder(li, d);
+    }
+    place(li);
   }
+  state.files.forEach((f, idx) => {
+    const key = `f|${f.path}|${f.size}|${f.modified}`;
+    keep.add(key);
+    let li = existing.get(key);
+    if (!li) {
+      li = $('#file-tpl').content.firstElementChild.cloneNode(true);
+      li.dataset.key = key;
+      fillCard(li, f);
+    }
+    li.dataset.index = String(idx);
+    const sel = $('.sel', li);
+    sel.checked = state.selected.has(f.path);
+    li.classList.toggle('selected', sel.checked);
+    const busy = state.busy.get(f.path);
+    const status = $('.status', li);
+    status.hidden = !busy;
+    if (busy) { status.textContent = busy.text; status.classList.toggle('err', !!busy.error); }
+    place(li);
+  });
   existing.forEach((li, key) => { if (!keep.has(key)) li.remove(); });
 
-  $('#empty').hidden = state.files.length > 0;
-  $('#count').textContent = state.files.length ? `${state.files.length} file` : '';
-  $('#download-selected').disabled = state.selected.size === 0;
-  $('#delete-selected').disabled = state.selected.size === 0;
-  $('#download-selected').textContent = state.selected.size ? `Tải về ${state.selected.size} mục đã chọn` : 'Tải về các mục đã chọn';
-  $('#select-all').textContent = state.selected.size && state.selected.size === state.files.length ? 'Bỏ chọn' : 'Chọn tất cả';
+  const n = state.selected.size;
+  $('#empty').hidden = state.files.length + state.folders.length > 0;
+  const parts = [];
+  if (state.folders.length) parts.push(`${state.folders.length} thư mục`);
+  if (state.files.length) parts.push(`${state.files.length} file`);
+  $('#count').textContent = parts.join(', ');
+  $('#download-selected').disabled = n === 0;
+  $('#delete-selected').disabled = n === 0;
+  $('#download-selected').textContent = n ? `Tải về ${n} mục đã chọn` : 'Tải về các mục đã chọn';
+  $('#delete-selected').textContent = n ? `Xoá ${n} mục` : 'Xoá';
+  $('#select-all').disabled = state.files.length === 0;
+  $('#select-all').textContent = n && n === state.files.length ? 'Bỏ chọn' : 'Chọn tất cả';
+}
+
+function fillFolder(li, d) {
+  $('.name', li).textContent = d.name;
+  $('.name', li).title = d.name;
+  $('.count', li).textContent = d.items ? `${d.items} mục` : 'Trống';
+  li.querySelectorAll('.folder-open').forEach((b) => b.addEventListener('click', () => openDir(d.path)));
+  $('.del', li).addEventListener('click', async () => {
+    if (!confirm(`Xoá thư mục "${d.name}"?`)) return;
+    const { res } = await api('/api/files/' + encPath(d.path), { method: 'DELETE' });
+    if (res.status === 409) alert('Thư mục còn file bên trong. Hãy xoá hoặc chuyển các file đó trước.');
+    refresh();
+  });
 }
 
 function fillCard(li, f) {
-  const enc = encodeURIComponent(f.name);
   $('.name', li).textContent = f.name;
   $('.name', li).title = f.name;
   $('.size', li).textContent = fmtSize(f.size);
@@ -385,57 +495,45 @@ function fillCard(li, f) {
 
   const img = $('img', li);
   const icon = $('.kind-icon', li);
-  const original = `/api/files/${enc}?inline=1`;
-  img.src = `/api/thumbs/${enc}?v=${f.modified}`;
+  $('.play', li).hidden = f.kind !== 'video';
+  img.src = `/api/thumbs/${encPath(f.path)}?v=${f.modified}`;
   img.onerror = () => {
-    const canShow = f.kind === 'image' && (NATIVE_IMAGES.has(f.format) || (f.format === 'heic' && state.caps.heic));
-    if (canShow && img.dataset.fallback !== '1') {
+    if (f.kind === 'image' && canShowImage(f) && img.dataset.fallback !== '1') {
       img.dataset.fallback = '1';
-      img.src = original;
+      img.src = fileURL(f, true);
       return;
     }
     img.hidden = true;
     icon.hidden = false;
-    icon.textContent = f.kind === 'video' ? '🎬 Video' : f.kind === 'image' ? '🖼️ ' + f.format.toUpperCase() : '📄 File';
+    icon.textContent = f.kind === 'video' ? 'Video ' + f.format.toUpperCase()
+      : f.kind === 'image' ? 'Ảnh ' + f.format.toUpperCase() : 'File';
   };
 
   $('.sel', li).addEventListener('change', (e) => {
-    if (e.target.checked) state.selected.add(f.name); else state.selected.delete(f.name);
+    if (e.target.checked) state.selected.add(f.path); else state.selected.delete(f.path);
     render();
   });
+  $('.open', li).addEventListener('click', () => openViewer(Number(li.dataset.index)));
   $('.dl', li).addEventListener('click', () => download(f));
-  $('.view', li).addEventListener('click', () => view(f));
-  const del = $('.del', li);
-  if (!(state.info && state.info.isLocal)) del.hidden = true;
-  del.addEventListener('click', async () => {
-    if (!confirm(`Xoá "${f.name}" khỏi máy tính?`)) return;
-    await api('/api/files/' + enc, { method: 'DELETE' });
+  $('.del', li).addEventListener('click', async () => {
+    if (!confirm(`Xoá "${f.name}" khỏi thư mục chia sẻ? Thao tác này không hoàn tác được.`)) return;
+    await api('/api/files/' + encPath(f.path), { method: 'DELETE' });
     refresh();
   });
 }
 
 function setBusy(f, text, error) {
-  if (text) state.busy.set(f.name, { text, error }); else state.busy.delete(f.name);
+  if (text) state.busy.set(f.path, { text, error }); else state.busy.delete(f.path);
   render();
 }
 
-// prepare returns a URL for the file in the form this device needs,
-// converting on the computer first when necessary.
-async function prepare(f) {
-  const to = conversionFor(f);
-  if (!to) return { url: '/api/files/' + encodeURIComponent(f.name), converted: false };
-  setBusy(f, 'Đang đổi sang ' + to.toUpperCase() + '…');
+// convert asks the computer for a copy of f in format `to` and waits for it.
+// The original file is never changed.
+async function convert(f, to, onStatus) {
   for (;;) {
-    const { res, body } = await api('/api/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: f.name, to }),
-    });
+    const { res, body } = await postJSON('/api/convert', { path: f.path, to });
     if (!res.ok) throw new Error(body.error || res.status);
-    if (body.state === 'ready') {
-      setBusy(f, null);
-      return { url: body.url, converted: true };
-    }
+    if (body.state === 'ready') return body.url;
     if (body.state === 'error') {
       const msg = body.error === 'ffmpeg-missing'
         ? 'Máy tính chưa cài ffmpeg nên chưa đổi được video.'
@@ -447,7 +545,7 @@ async function prepare(f) {
       throw err;
     }
     const pct = body.state === 'working' && body.progress > 0 ? ' ' + Math.floor(body.progress * 100) + '%' : '';
-    setBusy(f, (body.state === 'queued' ? 'Đang chờ đổi định dạng…' : 'Đang đổi sang ' + to.toUpperCase()) + pct);
+    onStatus((body.state === 'queued' ? 'Đang chờ đổi định dạng…' : 'Đang đổi sang ' + to.toUpperCase()) + pct);
     await sleep(1000);
   }
 }
@@ -463,25 +561,136 @@ function triggerDownload(url) {
 }
 
 async function download(f) {
+  const to = conversionFor(f);
+  if (!to) { triggerDownload(fileURL(f)); return; }
   try {
-    const { url } = await prepare(f);
+    setBusy(f, 'Đang đổi sang ' + to.toUpperCase() + '…');
+    const url = await convert(f, to, (t) => setBusy(f, t));
+    setBusy(f, null);
     triggerDownload(url);
   } catch (err) {
     setBusy(f, err.message + (err.canFallback ? ' Đang tải file gốc.' : ''), true);
-    if (err.canFallback) triggerDownload('/api/files/' + encodeURIComponent(f.name));
+    if (err.canFallback) triggerDownload(fileURL(f));
   }
 }
 
-async function view(f) {
-  // Open the tab first so pop-up blockers allow it, then point it at the file.
-  const win = window.open('about:blank', '_blank');
+// ---------- Viewer ----------
+
+let viewToken = 0;
+
+function setupViewer() {
+  const dlg = $('#viewer');
+  $('#v-close').addEventListener('click', () => dlg.close());
+  $('#v-prev').addEventListener('click', () => step(-1));
+  $('#v-next').addEventListener('click', () => step(1));
+  $('#v-download').addEventListener('click', () => {
+    const f = state.files[state.viewIndex];
+    if (f) download(f);
+  });
+  dlg.addEventListener('close', () => {
+    viewToken++;
+    const v = $('#v-video');
+    v.pause();
+    v.removeAttribute('src');
+    v.load();
+    $('#v-img').removeAttribute('src');
+  });
+  dlg.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') step(-1);
+    if (e.key === 'ArrowRight') step(1);
+  });
+  let x0 = null;
+  const stage = $('#v-stage');
+  stage.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; }, { passive: true });
+  stage.addEventListener('touchend', (e) => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0;
+    x0 = null;
+    if (Math.abs(dx) > 60) step(dx < 0 ? 1 : -1);
+  });
+}
+
+function step(d) {
+  const i = state.viewIndex + d;
+  if (i >= 0 && i < state.files.length) showInViewer(i);
+}
+
+function openViewer(i) {
+  const dlg = $('#viewer');
+  if (!dlg.open) dlg.showModal();
+  showInViewer(i);
+}
+
+async function showInViewer(i) {
+  const f = state.files[i];
+  if (!f) return;
+  const token = ++viewToken;
+  state.viewIndex = i;
+  const img = $('#v-img');
+  const video = $('#v-video');
+  const msg = $('#v-msg');
+  const note = $('#v-note');
+  $('#v-name').textContent = f.name;
+  $('#v-pos').textContent = `${i + 1} / ${state.files.length}`;
+  $('#v-prev').disabled = i === 0;
+  $('#v-next').disabled = i === state.files.length - 1;
+  img.hidden = true;
+  video.hidden = true;
+  video.pause();
+  video.removeAttribute('src');
+  msg.hidden = true;
+  note.textContent = '';
+  const say = (t) => { if (token === viewToken) { msg.textContent = t; msg.hidden = false; } };
+
+  // Show the original when this browser can; otherwise a temporary copy
+  // made on the computer. Either way the original file stays untouched.
+  const viaCopy = async (to) => {
+    say('Đang chuẩn bị bản xem…');
+    const url = await convert(f, to, say);
+    if (token !== viewToken) return null;
+    msg.hidden = true;
+    note.textContent = to === 'mp4'
+      ? 'Đang xem bản MP4 tạm, file gốc vẫn giữ nguyên.'
+      : 'Đang xem bản JPG tạm, file gốc vẫn giữ nguyên.';
+    return withInline(url);
+  };
+
   try {
-    const { url } = await prepare(f);
-    const inline = url + (url.includes('?') ? '&' : '?') + 'inline=1';
-    if (win) win.location.href = inline; else location.href = inline;
+    if (f.kind === 'image') {
+      let triedCopy = false;
+      img.onerror = async () => {
+        if (triedCopy || token !== viewToken) { say('Không hiển thị được ảnh này. Bạn vẫn có thể tải về.'); img.hidden = true; return; }
+        triedCopy = true;
+        try { const u = await viaCopy('jpg'); if (u) img.src = u; } catch (e) { img.hidden = true; say(e.message); }
+      };
+      img.onload = () => { if (token === viewToken) { img.hidden = false; msg.hidden = true; } };
+      if (canShowImage(f)) {
+        img.src = fileURL(f, true);
+      } else {
+        triedCopy = true;
+        const u = await viaCopy('jpg');
+        if (u) img.src = u;
+      }
+    } else if (f.kind === 'video') {
+      let triedCopy = false;
+      video.onerror = async () => {
+        if (triedCopy || token !== viewToken) { video.hidden = true; say('Không phát được video này. Bạn vẫn có thể tải về.'); return; }
+        triedCopy = true;
+        try { const u = await viaCopy('mp4'); if (u) { video.src = u; video.hidden = false; } } catch (e) { video.hidden = true; say(e.message); }
+      };
+      if (canPlayVideo(f)) {
+        video.src = fileURL(f, true);
+        video.hidden = false;
+      } else {
+        triedCopy = true;
+        const u = await viaCopy('mp4');
+        if (u) { video.src = u; video.hidden = false; }
+      }
+    } else {
+      say('Không xem trước được loại file này. Bấm Tải về để lấy file.');
+    }
   } catch (err) {
-    if (win) win.close();
-    setBusy(f, err.message, true);
+    say(err.message + ' Bấm Tải về để lấy file gốc.');
   }
 }
 

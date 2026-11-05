@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 // received, so the saved file is the phone's original.
 
 type uploadMeta struct {
+	Dir          string `json:"dir"` // folder inside the shared folder, "" for the top
 	Name         string `json:"name"`
 	Size         int64  `json:"size"`
 	LastModified int64  `json:"lastModified"` // milliseconds since 1970, from the browser
@@ -37,11 +39,24 @@ func (s *Server) handleUploadInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.Name = SafeName(m.Name)
+	dir, ok := cleanRel(m.Dir)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad folder"})
+		return
+	}
+	m.Dir = dir
+	if abs, ok := s.resolve(dir); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad folder"})
+		return
+	} else if st, err := os.Stat(abs); err != nil || !st.IsDir() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "folder not found"})
+		return
+	}
 	if m.Size < 0 || m.Size > 1<<40 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad size"})
 		return
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", m.Name, m.Size, m.LastModified)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%d", m.Dir, m.Name, m.Size, m.LastModified)))
 	id := hex.EncodeToString(sum[:16])
 
 	l := s.lockFor(s.uploadMus, id)
@@ -172,8 +187,15 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) finishUpload(id string, m uploadMeta) (fileInfo, error) {
 	metaPath, partPath := s.uploadPaths(id)
+	dir, ok := s.resolve(m.Dir)
+	if !ok {
+		return fileInfo{}, errors.New("bad folder")
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return fileInfo{}, errors.New("the folder was deleted while uploading")
+	}
 	s.finishMu.Lock()
-	dst, err := uniquePath(s.cfg.DataDir, m.Name)
+	dst, err := uniquePath(dir, m.Name)
 	if err == nil {
 		err = os.Rename(partPath, dst)
 	}
@@ -186,7 +208,7 @@ func (s *Server) finishUpload(id string, m uploadMeta) (fileInfo, error) {
 		t := time.UnixMilli(m.LastModified)
 		_ = os.Chtimes(dst, t, t)
 	}
-	return s.describe(filepath.Base(dst))
+	return s.describe(path.Join(m.Dir, filepath.Base(dst)))
 }
 
 // SafeName turns a name sent by a phone into a plain file name that cannot

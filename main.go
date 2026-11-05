@@ -35,10 +35,7 @@ import (
 var version = "dev"
 
 func main() {
-	home, _ := os.UserHomeDir()
-	defaultDir := filepath.Join(home, "PhotoBridge")
-
-	dataDir := flag.String("dir", defaultDir, "thư mục lưu file nhận được / folder for received and shared files")
+	dataDir := flag.String("dir", "", "thư mục chia sẻ (mặc định: thư mục shared cạnh file chạy) / shared folder (default: shared next to the program)")
 	port := flag.Int("port", 8686, "cổng web / web port")
 	noBrowser := flag.Bool("no-browser", false, "không tự mở trình duyệt / do not open the browser")
 	newToken := flag.Bool("new-key", false, "tạo mã truy cập mới (điện thoại cũ phải quét lại) / make a new access key")
@@ -61,17 +58,15 @@ func main() {
 }
 
 func run(dataDir string, port int, openBrowser, newToken bool) error {
-	dataDir, err := filepath.Abs(dataDir)
+	dataDir, stateDir, err := chooseFolders(dataDir)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return err
-	}
-	token, err := loadToken(dataDir, newToken)
+	token, err := loadToken(stateDir, newToken)
 	if err != nil {
 		return err
 	}
+	hideFolder(stateDir)
 
 	var extra []string
 	if exe, err := os.Executable(); err == nil {
@@ -93,12 +88,13 @@ func run(dataDir string, port int, openBrowser, newToken bool) error {
 	}
 
 	srv, err := server.New(server.Config{
-		DataDir: dataDir,
-		Token:   token,
-		Tools:   tools,
-		Version: version,
-		Web:     web.Files(),
-		URLs:    urls,
+		DataDir:  dataDir,
+		StateDir: stateDir,
+		Token:    token,
+		Tools:    tools,
+		Version:  version,
+		Web:      web.Files(),
+		URLs:     urls,
 	})
 	if err != nil {
 		return err
@@ -159,10 +155,67 @@ func listen(port int) (net.Listener, int, error) {
 	return ln, ln.Addr().(*net.TCPAddr).Port, nil
 }
 
+// chooseFolders picks the shared folder and the app's own data folder.
+//
+// By default everything lives next to the program: double-click photobridge
+// and it uses (and creates) "shared" beside it, so the program and its files
+// can sit together on any drive or USB stick. When that place cannot be
+// written to (a read-only location, macOS running a downloaded app from a
+// temporary copy, or "go run"), it falls back to PhotoBridge in the home folder.
+func chooseFolders(flagDir string) (dataDir, stateDir string, err error) {
+	if flagDir != "" {
+		dataDir, err = filepath.Abs(flagDir)
+		if err != nil {
+			return "", "", err
+		}
+		return dataDir, filepath.Join(dataDir, ".photobridge"), os.MkdirAll(dataDir, 0o755)
+	}
+	base := ""
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = real
+		}
+		dir := filepath.Dir(exe)
+		if usableBase(dir) {
+			base = dir
+		}
+	}
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", err
+		}
+		base = filepath.Join(home, "PhotoBridge")
+	}
+	dataDir = filepath.Join(base, "shared")
+	stateDir = filepath.Join(base, ".photobridge")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return "", "", err
+	}
+	return dataDir, stateDir, nil
+}
+
+func usableBase(dir string) bool {
+	tmp := os.TempDir()
+	if real, err := filepath.EvalSymlinks(tmp); err == nil {
+		tmp = real
+	}
+	if strings.HasPrefix(dir, tmp) || strings.Contains(dir, "go-build") || strings.Contains(dir, "AppTranslocation") {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".photobridge-write-test-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
+}
+
 // loadToken keeps the access key between runs so phones that scanned once
 // stay connected.
-func loadToken(dataDir string, fresh bool) (string, error) {
-	dir := filepath.Join(dataDir, ".photobridge")
+func loadToken(dir string, fresh bool) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -185,7 +238,7 @@ func loadToken(dataDir string, fresh bool) (string, error) {
 func printBanner(dataDir string, port int, urls []string, tools media.Tools) {
 	fmt.Println()
 	fmt.Println("  PhotoBridge", version)
-	fmt.Println("  Thư mục lưu file:", dataDir)
+	fmt.Println("  Thư mục chia sẻ:", dataDir)
 	fmt.Printf("  Trên máy tính, mở: http://localhost:%d/\n", port)
 	if len(urls) == 0 {
 		fmt.Println("  Chưa thấy mạng Wi-Fi/LAN. Hãy kết nối mạng rồi mở lại.")

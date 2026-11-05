@@ -31,7 +31,7 @@
           <label class="inline" id="url-pick-wrap" hidden>Địa chỉ khác:
             <select id="url-pick"></select>
           </label>
-          <p class="muted">Thư mục lưu file: <span class="mono" id="data-dir"></span></p>
+          <p class="muted">Thư mục chia sẻ trên máy tính: <span class="mono" id="data-dir"></span></p>
         </div>
       </div>
       <div id="tool-warn" class="warn" hidden></div>
@@ -39,6 +39,7 @@
 
     <section class="card">
       <h2>Gửi lên máy tính</h2>
+      <p class="muted target">Gửi vào: <b id="upload-target">shared</b></p>
       <div id="drop" class="drop">
         <label class="btn primary big">
           <input id="pick" type="file" multiple hidden>
@@ -64,32 +65,37 @@
 
     <section class="card">
       <div class="row between">
-        <h2>Ảnh và video trên máy tính</h2>
+        <nav id="crumbs" class="crumbs" aria-label="Thư mục"></nav>
         <span id="count" class="muted"></span>
       </div>
-      <div class="settings">
-        <label>Khi tải về máy này
-          <select id="mode">
-            <option value="auto">Tự đổi định dạng nếu máy này không đọc được</option>
-            <option value="original">Luôn tải file gốc</option>
-            <option value="compat">Luôn đổi sang JPG/PNG và MP4 (H.264)</option>
-          </select>
-        </label>
-        <label>Đổi ảnh sang
-          <select id="img-format">
-            <option value="jpg">JPG (nhẹ, phổ biến)</option>
-            <option value="png">PNG (không mất chi tiết, nặng hơn)</option>
-          </select>
-        </label>
-        <p id="caps" class="muted"></p>
-      </div>
       <div class="row actions">
+        <button id="new-folder" class="btn">+ Thư mục mới</button>
         <button id="select-all" class="btn">Chọn tất cả</button>
         <button id="download-selected" class="btn primary" disabled>Tải về các mục đã chọn</button>
-        <button id="delete-selected" class="btn danger pc-only" hidden disabled>Xoá các mục đã chọn</button>
+        <button id="delete-selected" class="btn danger" disabled>Xoá</button>
       </div>
-      <p id="empty" class="empty" hidden>Chưa có file nào. Gửi ảnh từ điện thoại, hoặc chép file vào thư mục lưu trên máy tính.</p>
+      <p id="empty" class="empty" hidden>Thư mục trống. Gửi ảnh từ điện thoại, hoặc chép file vào thư mục shared trên máy tính.</p>
       <ul id="files" class="grid"></ul>
+      <details class="settings-box">
+        <summary>Cài đặt khi tải về và xem</summary>
+        <div class="settings">
+          <label>Khi tải về máy này
+            <select id="mode">
+              <option value="auto">Tự đổi định dạng nếu máy này không đọc được</option>
+              <option value="original">Luôn tải file gốc</option>
+              <option value="compat">Luôn đổi sang JPG/PNG và MP4 (H.264)</option>
+            </select>
+          </label>
+          <label>Đổi ảnh sang
+            <select id="img-format">
+              <option value="jpg">JPG (nhẹ, phổ biến)</option>
+              <option value="png">PNG (không mất chi tiết, nặng hơn)</option>
+            </select>
+          </label>
+          <p id="caps" class="muted"></p>
+          <p class="muted">Khi xem trên web, file gốc luôn được giữ nguyên. Nếu trình duyệt không mở được HEIC hay HEVC, máy tính tạo một bản tạm để hiển thị.</p>
+        </div>
+      </details>
     </section>
   </main>
 
@@ -97,24 +103,58 @@
 
   <template id="file-tpl">
     <li class="file">
-      <label class="thumb">
-        <input type="checkbox" class="sel">
-        <img alt="" loading="lazy" decoding="async">
-        <span class="kind-icon" hidden></span>
-      </label>
+      <div class="thumb">
+        <input type="checkbox" class="sel" aria-label="Chọn">
+        <button class="open" aria-label="Xem">
+          <img alt="" loading="lazy" decoding="async">
+          <span class="kind-icon" hidden></span>
+          <span class="play" hidden aria-hidden="true">▶</span>
+        </button>
+      </div>
       <div class="meta">
         <div class="name"></div>
         <div class="info"><span class="size"></span> <span class="badges"></span></div>
         <div class="status" hidden></div>
-        <progress hidden max="1" value="0"></progress>
         <div class="row btns">
           <button class="btn sm dl">Tải về</button>
-          <button class="btn sm view">Xem</button>
-          <button class="btn sm ghost del" title="Xoá">Xoá</button>
+          <button class="btn sm ghost del">Xoá</button>
         </div>
       </div>
     </li>
   </template>
+
+  <template id="folder-tpl">
+    <li class="file folder">
+      <button class="thumb open folder-open" aria-label="Mở thư mục"><span class="folder-icon" aria-hidden="true"></span></button>
+      <div class="meta">
+        <div class="name"></div>
+        <div class="info count"></div>
+        <div class="row btns">
+          <button class="btn sm folder-open">Mở</button>
+          <button class="btn sm ghost del">Xoá</button>
+        </div>
+      </div>
+    </li>
+  </template>
+
+  <dialog id="viewer" class="viewer">
+    <div class="v-top">
+      <span id="v-name" class="v-name"></span>
+      <span id="v-pos" class="muted"></span>
+      <button id="v-close" class="btn sm" aria-label="Đóng">Đóng</button>
+    </div>
+    <div id="v-stage" class="v-stage">
+      <img id="v-img" alt="" hidden>
+      <video id="v-video" controls playsinline preload="metadata" hidden></video>
+      <p id="v-msg" class="v-msg" hidden></p>
+      <button id="v-prev" class="v-nav prev" aria-label="Trước">‹</button>
+      <button id="v-next" class="v-nav next" aria-label="Sau">›</button>
+    </div>
+    <div class="v-bottom row">
+      <span id="v-note" class="muted"></span>
+      <button id="v-download" class="btn sm primary">Tải về</button>
+    </div>
+  </dialog>
 
   <script src="app.js"></script>
 </body>

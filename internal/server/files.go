@@ -4,26 +4,41 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/thienanblog/ios-pc-android-transfer/internal/media"
 )
 
+// Paths in the API are relative to the shared folder and use "/" on every
+// system, for example "Trip 2026/IMG_0001.HEIC". "" is the shared folder itself.
+
 type fileInfo struct {
 	Name       string `json:"name"`
+	Path       string `json:"path"`
 	Size       int64  `json:"size"`
 	Modified   int64  `json:"modified"` // milliseconds since 1970
 	Kind       string `json:"kind"`
 	Format     string `json:"format"`
 	VideoCodec string `json:"videoCodec,omitempty"`
+}
+
+type folderInfo struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Modified int64  `json:"modified"`
+	Items    int    `json:"items"`
 }
 
 type probeEntry struct {
@@ -32,9 +47,56 @@ type probeEntry struct {
 	info  media.Info
 }
 
-// describe returns details of a file in the shared folder, caching the probe.
-func (s *Server) describe(name string) (fileInfo, error) {
-	st, err := os.Stat(filepath.Join(s.cfg.DataDir, name))
+// cleanRel checks a relative path from a request. It refuses anything that
+// could leave the shared folder or reach hidden files.
+func cleanRel(rel string) (string, bool) {
+	rel = strings.Trim(rel, "/")
+	if rel == "" {
+		return "", true
+	}
+	if strings.ContainsRune(rel, '\\') || len(rel) > 1024 {
+		return "", false
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, ".") {
+			return "", false
+		}
+		for _, r := range part {
+			if unicode.IsControl(r) {
+				return "", false
+			}
+		}
+	}
+	return rel, true
+}
+
+// resolve turns a clean relative path into an absolute one, refusing
+// symbolic links on the way so nothing outside the shared folder is reachable.
+func (s *Server) resolve(rel string) (string, bool) {
+	rel, ok := cleanRel(rel)
+	if !ok {
+		return "", false
+	}
+	abs := s.cfg.DataDir
+	if rel == "" {
+		return abs, true
+	}
+	for _, part := range strings.Split(rel, "/") {
+		abs = filepath.Join(abs, part)
+		if st, err := os.Lstat(abs); err == nil && st.Mode()&os.ModeSymlink != 0 {
+			return "", false
+		}
+	}
+	return abs, true
+}
+
+// describe returns details of a file, caching the format probe.
+func (s *Server) describe(rel string) (fileInfo, error) {
+	abs, ok := s.resolve(rel)
+	if !ok {
+		return fileInfo{}, errors.New("bad path")
+	}
+	st, err := os.Lstat(abs)
 	if err != nil {
 		return fileInfo{}, err
 	}
@@ -42,78 +104,137 @@ func (s *Server) describe(name string) (fileInfo, error) {
 		return fileInfo{}, errors.New("not a file")
 	}
 	s.mu.Lock()
-	pe, ok := s.probes[name]
+	pe, ok := s.probes[rel]
 	s.mu.Unlock()
 	if !ok || pe.size != st.Size() || !pe.mtime.Equal(st.ModTime()) {
-		info, err := media.ProbeFile(filepath.Join(s.cfg.DataDir, name))
+		info, err := media.ProbeFile(abs)
 		if err != nil {
 			info = media.Info{Kind: media.KindOther, Format: "other"}
 		}
 		pe = probeEntry{size: st.Size(), mtime: st.ModTime(), info: info}
 		s.mu.Lock()
-		s.probes[name] = pe
+		if len(s.probes) > 50000 {
+			s.probes = map[string]probeEntry{}
+		}
+		s.probes[rel] = pe
 		s.mu.Unlock()
 	}
 	return fileInfo{
-		Name: name, Size: st.Size(), Modified: st.ModTime().UnixMilli(),
+		Name: path.Base(rel), Path: rel, Size: st.Size(), Modified: st.ModTime().UnixMilli(),
 		Kind: string(pe.info.Kind), Format: pe.info.Format, VideoCodec: pe.info.VideoCodec,
 	}, nil
 }
 
-// lookup checks that name is a plain, visible file directly in the shared folder.
-func (s *Server) lookup(name string) (string, fileInfo, bool) {
-	if name == "" || name != filepath.Base(name) || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) {
+// lookup finds a visible regular file by its relative path.
+func (s *Server) lookup(rel string) (string, fileInfo, bool) {
+	rel, ok := cleanRel(rel)
+	if !ok || rel == "" {
 		return "", fileInfo{}, false
 	}
-	fi, err := s.describe(name)
+	fi, err := s.describe(rel)
 	if err != nil {
 		return "", fileInfo{}, false
 	}
-	return filepath.Join(s.cfg.DataDir, name), fi, true
+	abs, _ := s.resolve(rel)
+	return abs, fi, true
+}
+
+func visible(name string) bool {
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "~$") {
+		return false
+	}
+	switch strings.ToLower(name) {
+	case "desktop.ini", "thumbs.db", "$recycle.bin", "system volume information":
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	entries, err := os.ReadDir(s.cfg.DataDir)
+	dir, ok := cleanRel(r.URL.Query().Get("dir"))
+	absDir, ok2 := s.resolve(dir)
+	if !ok || !ok2 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad folder"})
+		return
+	}
+	entries, err := os.ReadDir(absDir)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "folder not found"})
 		return
 	}
 	files := []fileInfo{}
-	seen := map[string]bool{}
+	folders := []folderInfo{}
 	for _, e := range entries {
 		n := e.Name()
-		if strings.HasPrefix(n, ".") || !e.Type().IsRegular() || isJunk(n) {
+		if !visible(n) {
 			continue
 		}
-		fi, err := s.describe(n)
-		if err != nil {
-			continue
+		rel := path.Join(dir, n)
+		switch {
+		case e.Type().IsDir():
+			fi := folderInfo{Name: n, Path: rel}
+			if info, err := e.Info(); err == nil {
+				fi.Modified = info.ModTime().UnixMilli()
+			}
+			if sub, err := os.ReadDir(filepath.Join(absDir, n)); err == nil {
+				for _, x := range sub {
+					if visible(x.Name()) {
+						fi.Items++
+					}
+				}
+			}
+			folders = append(folders, fi)
+		case e.Type().IsRegular():
+			if fi, err := s.describe(rel); err == nil {
+				files = append(files, fi)
+			}
 		}
-		seen[n] = true
-		files = append(files, fi)
 	}
-	s.mu.Lock()
-	for n := range s.probes {
-		if !seen[n] {
-			delete(s.probes, n)
-		}
-	}
-	s.mu.Unlock()
+	sort.Slice(folders, func(i, j int) bool {
+		return strings.ToLower(folders[i].Name) < strings.ToLower(folders[j].Name)
+	})
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Modified != files[j].Modified {
 			return files[i].Modified > files[j].Modified
 		}
 		return files[i].Name < files[j].Name
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	writeJSON(w, http.StatusOK, map[string]any{"dir": dir, "folders": folders, "files": files})
 }
 
-func isJunk(name string) bool {
-	switch strings.ToLower(name) {
-	case "desktop.ini", "thumbs.db", ".ds_store":
-		return true
+func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Dir  string `json:"dir"`
+		Name string `json:"name"`
 	}
-	return false
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
+		return
+	}
+	parent, ok := s.resolve(req.Dir)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad folder"})
+		return
+	}
+	if st, err := os.Stat(parent); err != nil || !st.IsDir() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "folder not found"})
+		return
+	}
+	name := SafeName(req.Name)
+	if strings.TrimSpace(req.Name) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty name"})
+		return
+	}
+	if err := os.Mkdir(filepath.Join(parent, name), 0o755); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "exists"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	rel, _ := cleanRel(req.Dir)
+	writeJSON(w, http.StatusOK, map[string]string{"path": path.Join(rel, name)})
 }
 
 func contentDisposition(kind, name string) string {
@@ -129,12 +250,12 @@ var mimeByFormat = map[string]string{
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	path, fi, ok := s.lookup(r.PathValue("name"))
+	abs, fi, ok := s.lookup(r.PathValue("path"))
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(abs)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -153,13 +274,47 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, fi.Name, time.UnixMilli(fi.Modified), f)
 }
 
+// handleDelete removes a file, or a folder only when it is empty, so one
+// tap on a phone can never wipe a whole album.
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	path, _, ok := s.lookup(r.PathValue("name"))
+	rel, ok := cleanRel(r.PathValue("path"))
+	if !ok || rel == "" {
+		http.NotFound(w, r)
+		return
+	}
+	abs, ok := s.resolve(rel)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if err := os.Remove(path); err != nil {
+	st, err := os.Lstat(abs)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if st.IsDir() {
+		entries, err := os.ReadDir(abs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		for _, e := range entries {
+			if visible(e.Name()) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "folder-not-empty"})
+				return
+			}
+		}
+		// Only system leftovers such as .DS_Store or Thumbs.db remain.
+		for _, e := range entries {
+			if !e.IsDir() {
+				os.Remove(filepath.Join(abs, e.Name()))
+			}
+		}
+	} else if !st.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	if err := os.Remove(abs); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -167,12 +322,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func fileKey(fi fileInfo, extra string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%s", fi.Name, fi.Size, fi.Modified, extra)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%s", fi.Path, fi.Size, fi.Modified, extra)))
 	return hex.EncodeToString(sum[:12])
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	path, fi, ok := s.lookup(r.PathValue("name"))
+	abs, fi, ok := s.lookup(r.PathValue("path"))
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -207,7 +362,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
 			defer cancel()
 			info := media.Info{Kind: media.Kind(fi.Kind), Format: fi.Format, VideoCodec: fi.VideoCodec}
-			return s.cfg.Tools.Thumbnail(ctx, path, thumb, info, 360)
+			return s.cfg.Tools.Thumbnail(ctx, abs, thumb, info, 360)
 		}()
 		l.Unlock()
 		if err == nil {
@@ -221,7 +376,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// Browsers show these themselves; fall back to the original.
 	switch fi.Format {
 	case "jpeg", "png", "gif", "webp":
-		serve(path)
+		serve(abs)
 		return
 	}
 	http.NotFound(w, r)
