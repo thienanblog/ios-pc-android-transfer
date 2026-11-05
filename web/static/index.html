@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>PhotoBridge</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M8 20l5-6 4 5 3-3 4 4z' fill='white'/%3E%3Ccircle cx='21' cy='11' r='2.5' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>PhotoBridge</h1>
+        <p class="sub">Chuyển ảnh và video giữa điện thoại và máy tính qua Wi-Fi</p>
+      </div>
+    </div>
+    <span id="conn" class="chip">Đang kết nối…</span>
+  </header>
+
+  <main>
+    <section id="pc-panel" class="card" hidden>
+      <div class="qr-wrap">
+        <img id="qr" alt="Mã QR để điện thoại kết nối" width="220" height="220">
+        <div>
+          <h2>Quét mã này bằng camera điện thoại</h2>
+          <p>Điện thoại và máy tính cần dùng chung một mạng Wi-Fi.</p>
+          <p class="mono" id="url-text"></p>
+          <label class="inline" id="url-pick-wrap" hidden>Địa chỉ khác:
+            <select id="url-pick"></select>
+          </label>
+          <p class="muted">Thư mục lưu file: <span class="mono" id="data-dir"></span></p>
+        </div>
+      </div>
+      <div id="tool-warn" class="warn" hidden></div>
+    </section>
+
+    <section class="card">
+      <h2>Gửi lên máy tính</h2>
+      <div id="drop" class="drop">
+        <label class="btn primary big">
+          <input id="pick" type="file" multiple hidden>
+          Chọn ảnh hoặc video
+        </label>
+        <p class="muted pc-only" hidden>…hoặc kéo thả file vào đây</p>
+      </div>
+      <p class="hint ios-only" hidden>
+        Giữ màn hình mở cho đến khi gửi xong. File được gửi nguyên bản, nhưng iPhone có thể tự đổi ảnh HEIC sang JPEG trước khi đưa cho trình duyệt.
+        Sau khi gửi, nhãn bên cạnh mỗi file cho biết máy tính nhận được định dạng gì.
+        <a href="#keep-original">Cách giữ file gốc</a>
+      </p>
+      <ul id="queue" class="queue"></ul>
+      <details id="keep-original" class="ios-only" hidden>
+        <summary>Cách chắc chắn giữ HEIC, HEVC gốc từ iPhone</summary>
+        <ol>
+          <li>Mở app Ảnh, chọn ảnh hoặc video, bấm Chia sẻ rồi chọn <b>Lưu vào Tệp</b>.</li>
+          <li>Quay lại trang này, bấm <b>Chọn ảnh hoặc video</b>, chọn <b>Chọn tệp</b> và lấy file từ app Tệp.</li>
+        </ol>
+        <p>File lấy từ app Tệp được gửi đúng từng byte, iPhone không chuyển đổi.</p>
+      </details>
+    </section>
+
+    <section class="card">
+      <div class="row between">
+        <h2>Ảnh và video trên máy tính</h2>
+        <span id="count" class="muted"></span>
+      </div>
+      <div class="settings">
+        <label>Khi tải về máy này
+          <select id="mode">
+            <option value="auto">Tự đổi định dạng nếu máy này không đọc được</option>
+            <option value="original">Luôn tải file gốc</option>
+            <option value="compat">Luôn đổi sang JPG/PNG và MP4 (H.264)</option>
+          </select>
+        </label>
+        <label>Đổi ảnh sang
+          <select id="img-format">
+            <option value="jpg">JPG (nhẹ, phổ biến)</option>
+            <option value="png">PNG (không mất chi tiết, nặng hơn)</option>
+          </select>
+        </label>
+        <p id="caps" class="muted"></p>
+      </div>
+      <div class="row actions">
+        <button id="select-all" class="btn">Chọn tất cả</button>
+        <button id="download-selected" class="btn primary" disabled>Tải về các mục đã chọn</button>
+        <button id="delete-selected" class="btn danger pc-only" hidden disabled>Xoá các mục đã chọn</button>
+      </div>
+      <p id="empty" class="empty" hidden>Chưa có file nào. Gửi ảnh từ điện thoại, hoặc chép file vào thư mục lưu trên máy tính.</p>
+      <ul id="files" class="grid"></ul>
+    </section>
+  </main>
+
+  <footer class="foot muted">PhotoBridge <span id="version"></span> · chỉ chạy trong mạng nội bộ, không gửi gì lên internet</footer>
+
+  <template id="file-tpl">
+    <li class="file">
+      <label class="thumb">
+        <input type="checkbox" class="sel">
+        <img alt="" loading="lazy" decoding="async">
+        <span class="kind-icon" hidden></span>
+      </label>
+      <div class="meta">
+        <div class="name"></div>
+        <div class="info"><span class="size"></span> <span class="badges"></span></div>
+        <div class="status" hidden></div>
+        <progress hidden max="1" value="0"></progress>
+        <div class="row btns">
+          <button class="btn sm dl">Tải về</button>
+          <button class="btn sm view">Xem</button>
+          <button class="btn sm ghost del" title="Xoá">Xoá</button>
+        </div>
+      </div>
+    </li>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
